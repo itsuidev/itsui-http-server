@@ -24,6 +24,7 @@ int validate_request(const HttpRequest *request);
 int parse_headers(char *buffer, HttpRequest *request);
 void send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers);
 int get_query_param(const HttpRequest *request, const char *name, char *value, size_t value_size);
+int url_decode(char *str);
 void handle_request(int client_fd, const HttpRequest *request);
 
 #endif

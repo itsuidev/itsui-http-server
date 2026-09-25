@@ -104,6 +104,50 @@ void send_response(int client_fd, int status_code, const char *status_text, cons
     check_error(send_status == 0, "Error while writing HTTP response");
 }
 
+static int hex_to_value(char c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+
+    return -1;
+}
+
+int url_decode(char *str) {
+    char *read = str;
+    char *write = str;
+
+    while (*read != '\0') {
+        if (*read == '%' && read[1] != '\0' && read[2] != '\0') {
+            int high = hex_to_value(read[1]);
+            int low = hex_to_value(read[2]);
+
+            if (high < 0 || low < 0) return -1;
+
+            *write = (char)(high * 16 + low);
+            read += 3;
+            write++;
+        } else if (*read == '+') {
+            *write = ' ';
+            read++;
+            write++; 
+        } else {
+            *write = *read;
+            read++;
+            write++;
+        }
+    }
+    *write = '\0';
+    return 0;
+}
+
 int get_query_param(const HttpRequest *request, const char *name, char *value, size_t value_size) {
     char query[256];
     
@@ -121,6 +165,9 @@ int get_query_param(const HttpRequest *request, const char *name, char *value, s
             if (strcmp(token, name) == 0) {
                 strncpy(value, equals + 1, value_size - 1);
                 value[value_size - 1] = '\0';
+
+                if (url_decode(value) < 0) return -1;
+
                 return 0;
             }
         }
@@ -128,7 +175,7 @@ int get_query_param(const HttpRequest *request, const char *name, char *value, s
         token = strtok(NULL, "&");
     }
 
-    return -1;
+    return 1;
 }
 
 void handle_request(int client_fd, const HttpRequest *request) {
@@ -139,8 +186,15 @@ void handle_request(int client_fd, const HttpRequest *request) {
 
     if (strcmp(request->path, "/hello") == 0) {
         char name[256];
+
+        int query_status = get_query_param(request, "name", name, sizeof(name));
+
+        if (query_status == -1) {
+            send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+            return;
+        }
         
-        if (get_query_param(request, "name", name, sizeof(name)) == 0) {
+        if (query_status == 0) {
             char body[256];
             snprintf(body, sizeof(body), "Hello, %.246s!\n", name);
             send_response(client_fd, HTTP_OK, "OK", body, "");
