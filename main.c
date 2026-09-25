@@ -20,6 +20,11 @@
 #define BUFFER_SIZE 1024
 #define MAX_HEADERS 32
 
+#define HTTP_OK 200
+#define HTTP_BAD_REQUEST 400
+#define HTTP_NOT_FOUND 404
+#define HTTP_METHOD_NOT_ALLOWED 405
+
 typedef struct {
     char name[64];
     char value[256];
@@ -33,6 +38,9 @@ typedef struct {
     HttpHeader headers[MAX_HEADERS];
     int header_count;
 } HttpRequest;
+
+int send_all(int client_fd, const char *buffer, size_t length);
+void send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers);
 
 int start_server(int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -57,6 +65,24 @@ int start_server(int port) {
     printf("Server is listening on port %d...\n", port);
 
     return server_fd;
+}
+
+int parse_request_line(const char *buffer, HttpRequest *request) {
+    int result = sscanf(buffer, "%15s %255s %15s",
+        request->method,
+        request->path,
+        request->version    
+    );
+
+    if (result != 3) return -1;
+    return 0;
+}
+
+int validate_request(const HttpRequest *request) {
+    if (strcmp(request->method, "GET") != 0) return 1;
+    if (strcmp(request->version, "HTTP/1.1") != 0) return -1;
+    if (request->path[0] != '/') return -1;
+    return 0;
 }
 
 int parse_headers(char * buffer, HttpRequest * request) {
@@ -99,25 +125,19 @@ int parse_headers(char * buffer, HttpRequest * request) {
     return 0;
 }
 
-int parse_request_line(const char *buffer, HttpRequest *request) {
-    int result = sscanf(buffer, "%15s %255s %15s",
-        request->method,
-        request->path,
-        request->version    
-    );
+int send_all(int client_fd, const char *buffer, size_t length) {
+    size_t total_sent = 0;
 
-    if (result != 3) return -1;
+    while (total_sent < length) {
+        ssize_t bytes_written = write(client_fd, buffer + total_sent, length - total_sent);
+        if (bytes_written <= 0) return -1;
+        total_sent += bytes_written;
+    }
+    
     return 0;
 }
 
-int validate_request(const HttpRequest *request) {
-    if (strcmp(request->method, "GET") != 0) return 1;
-    if (strcmp(request->version, "HTTP/1.1") != 0) return -1;
-    if (request->path[0] != '/') return -1;
-    return 0;
-}
-
-void send_response(int client_fd, int status_code, const char *status_text, const char *body) {
+void send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers) {
     char response[1024];
 
     int response_length = snprintf(
@@ -127,11 +147,13 @@ void send_response(int client_fd, int status_code, const char *status_text, cons
         "Content-Type: text/plain; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
+        "%s"
         "\r\n"
         "%s",
         status_code,
         status_text,
         strlen(body),
+        extra_headers,
         body
     );
 
@@ -140,8 +162,27 @@ void send_response(int client_fd, int status_code, const char *status_text, cons
         "Error while creating HTTP response"
     );
 
-    ssize_t bytes_written = write(client_fd, response, response_length);
-    check_error(bytes_written >= 0, "Error while writing HTTP response");
+    int send_status = send_all(client_fd, response, response_length);
+    check_error(send_status == 0, "Error while writing HTTP response");
+}
+
+void handle_request(int client_fd, const HttpRequest *request) {
+    if (strcmp(request->path, "/") == 0) {
+        send_response(client_fd, HTTP_OK, "OK", "Welcome to my C HTTP server!\n", "");
+        return;
+    }
+
+    if (strcmp(request->path, "/hello") == 0) {
+        send_response(client_fd, HTTP_OK, "OK", "Hello!\n", "");
+        return;
+    }
+
+    if (strcmp(request->path, "/about") == 0) {
+        send_response(client_fd, HTTP_OK, "OK", "This is my custom C HTTP server.\n", "");
+        return;
+    }
+
+    send_response(client_fd, HTTP_NOT_FOUND, "Not Found", "Not Found\n", "");
 }
 
 int main(int argc, char **argv) {
@@ -154,27 +195,49 @@ int main(int argc, char **argv) {
         check_error(client_fd >= 0, "Error while accepting client");
 
         char buffer[BUFFER_SIZE] = {0};
+        size_t total_read = 0;
 
-        ssize_t bytes_read = read(client_fd, buffer, BUFFER_SIZE - 1);
-        check_error(bytes_read >= 0, "Error while reading from client");
+        while (strstr(buffer, "\r\n\r\n") == NULL) {
+            if (total_read >= BUFFER_SIZE - 1) {
+                send_response(client_fd,  HTTP_BAD_REQUEST, "Bad Request", "Request too large\n", "");
+                close(client_fd);
+                break;
+            }
+
+            ssize_t bytes_read = read(client_fd, buffer + total_read, BUFFER_SIZE - 1 - total_read);
+            check_error(bytes_read >= 0, "Error while reading from client");
+
+            if (bytes_read == 0) {
+                close(client_fd);
+                break;
+            }
+
+            total_read += bytes_read;
+            buffer[total_read] = '\0';
+        }
+
+        printf("Finished reading request.\n");
+        printf("Buffer:\n%s\n", buffer);
+        
+        if (strstr(buffer, "\r\n\r\n") == NULL) continue;
 
         HttpRequest request;
 
         int parse_status = parse_request_line(buffer, &request);
         if (parse_status < 0) {
-            send_response(client_fd, 400, "Bad Request", "Bad Request\n");
+            send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
             close(client_fd);
             continue;
         }
 
         int validation_status = validate_request(&request);
         if (validation_status == -1) {
-            send_response(client_fd, 400, "Bad Request", "Bad Request\n");
+            send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
             close(client_fd);
             continue;
         }
          if (validation_status == 1) {
-            send_response(client_fd, 405, "Method Not Allowed", "Method Not Allowed\n");
+            send_response(client_fd, HTTP_METHOD_NOT_ALLOWED, "Method Not Allowed", "Method Not Allowed\n", "Allow: GET\r\n");
             close(client_fd);
             continue;
         }
@@ -185,7 +248,7 @@ int main(int argc, char **argv) {
 
         int headers_status = parse_headers(buffer, &request);
         if (headers_status < 0) {
-            send_response(client_fd, 400, "Bad Request", "Bad Request\n");
+            send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
             close(client_fd);
             continue;
         }
@@ -195,7 +258,7 @@ int main(int argc, char **argv) {
             printf("Header value: %s\n", request.headers[i].value);
         }
 
-        send_response(client_fd, 200, "OK", "Hello custom C HTTP server\n");
+        handle_request(client_fd, &request);
         close(client_fd);
         printf("Client connection closed.\n");
     }
