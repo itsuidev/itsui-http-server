@@ -19,6 +19,12 @@
 #define BACKLOG 5
 #define BUFFER_SIZE 1024
 
+typedef struct {
+    char method[16];
+    char path[256];
+    char version[16];
+} HttpRequest;
+
 int start_server(int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     check_error(server_fd >= 0, "Error while creating socket");
@@ -44,6 +50,17 @@ int start_server(int port) {
     return server_fd;
 }
 
+int parse_request_line(const char *buffer, HttpRequest *request) {
+    int result = sscanf(buffer, "%15s %255s %15s",
+        request->method,
+        request->path,
+        request->version    
+    );
+
+    if (result != 3) return -1;
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int server_fd = start_server(PORT);
 
@@ -63,7 +80,15 @@ int main(int argc, char **argv) {
             *line_end = '\0'; 
         }
 
-        printf("Primljen HTTP zahtev -> %s\n", buffer);
+        HttpRequest request;
+        int parse_status = parse_request_line(buffer, &request);
+
+        if (parse_status < 0) printf("Invalid HTTP request\n");
+        else {
+            printf("Method: %s\n", request.method);
+            printf("Path: %s\n", request.path);
+            printf("Version: %s\n", request.version);
+        }
 
         const char *http_response =
             "HTTP/1.1 200 OK\r\n"
