@@ -21,6 +21,7 @@ typedef struct {
 
 int parse_request_line(const char *buffer, HttpRequest *request);
 int validate_request(const HttpRequest *request);
+int get_header(const HttpRequest *request, const char *name, char *value, size_t value_size);
 int parse_headers(char *buffer, HttpRequest *request);
 int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers);
 int get_query_param(const HttpRequest *request, const char *name, char *value, size_t value_size);

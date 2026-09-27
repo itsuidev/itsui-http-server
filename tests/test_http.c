@@ -4,6 +4,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include "server.h"
 #include "http.h"
 
 static int passed = 0;
@@ -233,6 +234,48 @@ static void test_send_response(void) {
     check(strstr(response, "Content-Length: 0") != NULL, "send_response: empty Content-Length");
     close(fds[0]);
     close(fds[1]);
+
+    check(strstr(response, "Date: ") != NULL, "send_response: has Date header");
+    check(strstr(response, "GMT\r\n") != NULL, "send_response: Date ends with GMT");
+}
+
+static void test_get_header(void) {
+    HttpRequest req;
+    char value[64];
+    char buf[128];
+
+    // exact match
+    strcpy(buf, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    memset(&req, 0, sizeof(req));
+    parse_request_line(buf, &req);
+    parse_headers(buf, &req);
+    check(get_header(&req, "Host", value, sizeof(value)) == 0, "get_header: found Host");
+    check(str_eq(value, "example.com"), "get_header: Host value");
+
+    // case-insensitive: all variants find the same header
+    check(get_header(&req, "host", value, sizeof(value)) == 0, "get_header: lowercase query name");
+    check(get_header(&req, "HOST", value, sizeof(value)) == 0, "get_header: uppercase query name");
+    check(get_header(&req, "HoSt", value, sizeof(value)) == 0, "get_header: mixed case query name");
+
+    // non-existent -> 1
+    check(get_header(&req, "X-Nope", value, sizeof(value)) == 1, "get_header: missing -> 1");
+}
+
+static void test_handle_client_requires_host(void) {
+    int fds[2];
+    char response[2048];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+
+    const char *req = "GET / HTTP/1.1\r\n\r\n";
+    send(fds[1], req, strlen(req), 0);
+
+    set_client_timeout(fds[0], 1);
+    handle_client(fds[0]);
+
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "400 Bad Request") != NULL, "handle_client: missing Host -> 400");
+    close(fds[0]);
+    close(fds[1]);
 }
 
 int main(void) {
@@ -242,6 +285,8 @@ int main(void) {
     test_url_decode();
     test_get_query_param();
     test_send_response();
+    test_get_header();
+    test_handle_client_requires_host();
 
     printf("\n%d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

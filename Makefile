@@ -18,7 +18,7 @@ $(TEST_TARGET): $(TEST_SRC)
 $(TARGET): $(OBJ)
 	$(CC) $(OBJ) -o $(TARGET)
 
-test: $(TEST_TARGET)
+test: all $(TEST_TARGET)
 	./$(TEST_TARGET)
 
 src/%.o: src/%.c

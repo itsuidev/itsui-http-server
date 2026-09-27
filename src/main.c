@@ -8,6 +8,7 @@
 #include "common.h"
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
     int server_fd = start_server(PORT);

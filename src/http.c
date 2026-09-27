@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
+#include <time.h>
 
 #include "http.h"
 #include "server.h"
@@ -78,18 +80,25 @@ int parse_headers(char * buffer, HttpRequest * request) {
 int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers) {
     char header_buffer[BUFFER_SIZE];
 
+    time_t now = time(NULL);
+    struct tm *utc = gmtime(&now);
+    char date[64];
+    strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", utc);
+
     int header_length = snprintf(
         header_buffer,
         sizeof(header_buffer),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
+        "Date: %s\r\n"
         "Connection: close\r\n"
         "%s"
         "\r\n",
         status_code,
         status_text,
-        strlen(body),
+        strlen(body), 
+        date,
         extra_headers
     );
     if (header_length < 0 || (size_t)header_length >= (int)sizeof(header_buffer)) return -1;
@@ -177,6 +186,16 @@ int get_query_param(const HttpRequest *request, const char *name, char *value, s
     return 1;
 }
 
+int get_header(const HttpRequest *request, const char *name, char *value, size_t value_size) {
+    for (int i = 0; i < request->header_count; i++) {
+        if (strcasecmp(request->headers[i].name, name) != 0) continue;
+        strncpy(value, request->headers[i].value, value_size - 1);
+        value[value_size - 1] = '\0';
+        return 0;
+    }
+    return 1;
+}
+
 void handle_request(int client_fd, const HttpRequest *request) {
     if (strcmp(request->path, "/") == 0) {
         send_response(client_fd, HTTP_OK, "OK", "Welcome to my C HTTP server!\n", "");
@@ -243,20 +262,17 @@ void handle_client(int client_fd) {
         return;
     }
 
-    printf("Method: %s\n", request.method);
-    printf("Path: %s\n", request.path);
-    printf("Version: %s\n", request.version);
-
     int headers_status = parse_headers(buffer, &request);
     if (headers_status < 0) {
         send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
         return;
     }
-    
-    for (int i = 0; i < request.header_count; i++) {
-        printf("Header name: %s\n", request.headers[i].name);
-        printf("Header value: %s\n", request.headers[i].value);
-    }
 
+    char host[256];
+    if (get_header(&request, "Host", host, sizeof(host)) != 0) {
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Missing Host header\n", "");
+        return;
+    }
+    
     handle_request(client_fd, &request);
 }
