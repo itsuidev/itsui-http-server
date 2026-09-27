@@ -4,6 +4,11 @@
 #include <stddef.h>
 #include "common.h"
 
+typedef enum {
+    WITH_BODY,
+    WITHOUT_BODY
+} ResponseBody;
+
 typedef struct {
     char name[64];
     char value[256];
@@ -23,7 +28,7 @@ int parse_request_line(const char *buffer, HttpRequest *request);
 int validate_request(const HttpRequest *request);
 int get_header(const HttpRequest *request, const char *name, char *value, size_t value_size);
 int parse_headers(char *buffer, HttpRequest *request);
-int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers);
+int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers, ResponseBody body_mode);
 int get_query_param(const HttpRequest *request, const char *name, char *value, size_t value_size);
 int url_decode(char *str);
 void handle_request(int client_fd, const HttpRequest *request);

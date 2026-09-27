@@ -31,7 +31,7 @@ int parse_request_line(const char *buffer, HttpRequest *request) {
 }
 
 int validate_request(const HttpRequest *request) {
-    if (strcmp(request->method, "GET") != 0) return 1;
+    if (strcmp(request->method, "GET") != 0 && strcmp(request->method, "HEAD") != 0) return 1;
     if (strcmp(request->version, "HTTP/1.1") != 0) return -1;
     if (request->path[0] != '/') return -1;
     return 0;
@@ -77,7 +77,9 @@ int parse_headers(char * buffer, HttpRequest * request) {
     return 0;
 }
 
-int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers) {
+int send_response(int client_fd, int status_code, const char *status_text,
+                  const char *body, const char *extra_headers, ResponseBody body_mode) {
+
     char header_buffer[BUFFER_SIZE];
 
     time_t now = time(NULL);
@@ -107,7 +109,7 @@ int send_response(int client_fd, int status_code, const char *status_text, const
     if (header_status != 0) return -1;
 
     size_t body_length = strlen(body);
-    if (body_length == 0) return 0;
+    if (body_length == 0 || body_mode == WITHOUT_BODY) return 0;
 
     return send_all(client_fd, body, body_length);
 }
@@ -197,8 +199,9 @@ int get_header(const HttpRequest *request, const char *name, char *value, size_t
 }
 
 void handle_request(int client_fd, const HttpRequest *request) {
+    ResponseBody body_mode = strcmp(request->method, "HEAD") == 0 ? WITHOUT_BODY : WITH_BODY;
     if (strcmp(request->path, "/") == 0) {
-        send_response(client_fd, HTTP_OK, "OK", "Welcome to my C HTTP server!\n", "");
+        send_response(client_fd, HTTP_OK, "OK", "Welcome to my C HTTP server!\n", "", body_mode);
         return;
     }
 
@@ -208,27 +211,27 @@ void handle_request(int client_fd, const HttpRequest *request) {
         int query_status = get_query_param(request, "name", name, sizeof(name));
 
         if (query_status == -1) {
-            send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+            send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "", WITH_BODY);
             return;
         }
         
         if (query_status == 0) {
             char body[256];
             snprintf(body, sizeof(body), "Hello, %.246s!\n", name);
-            send_response(client_fd, HTTP_OK, "OK", body, "");
+            send_response(client_fd, HTTP_OK, "OK", body, "", body_mode);
             return;
         }
 
-        send_response(client_fd, HTTP_OK, "OK", "Hello!\n", "");
+        send_response(client_fd, HTTP_OK, "OK", "Hello!\n", "", body_mode);
         return;
     }
 
     if (strcmp(request->path, "/about") == 0) {
-        send_response(client_fd, HTTP_OK, "OK", "This is my custom C HTTP server.\n", "");
+        send_response(client_fd, HTTP_OK, "OK", "This is my custom C HTTP server.\n", "", body_mode);
         return;
     }
 
-    send_response(client_fd, HTTP_NOT_FOUND, "Not Found", "Not Found\n", "");
+    send_response(client_fd, HTTP_NOT_FOUND, "Not Found", "Not Found\n", "", body_mode);
 }
 
 void handle_client(int client_fd) {
@@ -236,7 +239,7 @@ void handle_client(int client_fd) {
 
     int read_status = read_request(client_fd, buffer, sizeof(buffer));
     if (read_status == -2) {
-        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Request too large\n", "");
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Request too large\n", "", WITH_BODY);
         return;
     }
 
@@ -248,29 +251,31 @@ void handle_client(int client_fd) {
 
     int parse_status = parse_request_line(buffer, &request);
     if (parse_status < 0) {
-        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "", WITH_BODY);
         return;
     }
 
+    ResponseBody body_mode = strcmp(request.method, "HEAD") == 0 ? WITHOUT_BODY : WITH_BODY;
+
     int validation_status = validate_request(&request);
     if (validation_status == -1) {
-        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "", body_mode);
         return;
     }
     if (validation_status == 1) {
-        send_response(client_fd, HTTP_METHOD_NOT_ALLOWED, "Method Not Allowed", "Method Not Allowed\n", "Allow: GET\r\n");
+        send_response(client_fd, HTTP_METHOD_NOT_ALLOWED, "Method Not Allowed", "Method Not Allowed\n", "Allow: GET, HEAD\r\n", body_mode);
         return;
     }
 
     int headers_status = parse_headers(buffer, &request);
     if (headers_status < 0) {
-        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "", body_mode);
         return;
     }
 
     char host[256];
     if (get_header(&request, "Host", host, sizeof(host)) != 0) {
-        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Missing Host header\n", "");
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Missing Host header\n", "", body_mode);
         return;
     }
     

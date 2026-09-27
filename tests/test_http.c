@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -194,11 +195,13 @@ static void test_send_response(void) {
     // 1. small body
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     char body[] = "Hello!";
-    check(send_response(fds[0], 200, "OK", body, "") == 0, "send_response: small body returns 0");
+    check(send_response(fds[0], 200, "OK", body, "", WITH_BODY) == 0, "send_response: small body returns 0");
     read_response(fds[1], response, sizeof(response));
     check(strstr(response, "HTTP/1.1 200 OK") != NULL, "send_response: status line");
     check(strstr(response, "Content-Length: 6") != NULL, "send_response: Content-Length matches body");
     check(strstr(response, "Hello!") != NULL, "send_response: body present");
+    check(strstr(response, "Date: ") != NULL, "send_response: has Date header");
+    check(strstr(response, "GMT\r\n") != NULL, "send_response: Date ends with GMT");
     close(fds[0]);
     close(fds[1]);
 
@@ -208,7 +211,7 @@ static void test_send_response(void) {
     memset(big_body, 'x', 5000);
     big_body[5000] = '\0';
 
-    check(send_response(fds[0], 200, "OK", big_body, "") == 0, "send_response: 5000 byte body returns 0");
+    check(send_response(fds[0], 200, "OK", big_body, "", WITH_BODY) == 0, "send_response: 5000 byte body returns 0");
     int total = read_response(fds[1], response, sizeof(response));
     check(strstr(response, "Content-Length: 5000") != NULL, "send_response: large Content-Length");
     check(total > 5000, "send_response: full large body received");
@@ -221,7 +224,7 @@ static void test_send_response(void) {
 
     // 3. error status
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
-    send_response(fds[0], 404, "Not Found", "Not Found\n", "");
+    send_response(fds[0], 404, "Not Found", "Not Found\n", "", WITH_BODY);
     read_response(fds[1], response, sizeof(response));
     check(strstr(response, "HTTP/1.1 404 Not Found") != NULL, "send_response: 404 status line");
     close(fds[0]);
@@ -229,14 +232,11 @@ static void test_send_response(void) {
 
     // 4. empty body - covers the early return branch
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
-    check(send_response(fds[0], 200, "OK", "", "") == 0, "send_response: empty body returns 0");
+    check(send_response(fds[0], 200, "OK", "", "", WITH_BODY) == 0, "send_response: empty body returns 0");
     read_response(fds[1], response, sizeof(response));
     check(strstr(response, "Content-Length: 0") != NULL, "send_response: empty Content-Length");
     close(fds[0]);
     close(fds[1]);
-
-    check(strstr(response, "Date: ") != NULL, "send_response: has Date header");
-    check(strstr(response, "GMT\r\n") != NULL, "send_response: Date ends with GMT");
 }
 
 static void test_get_header(void) {
@@ -278,6 +278,114 @@ static void test_handle_client_requires_host(void) {
     close(fds[1]);
 }
 
+static void test_send_response_without_body(void) {
+    int fds[2];
+    char response[4096];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+
+    const char *body = "This body must never be sent.\n";
+
+    check(send_response(fds[0], 200, "OK", body, "", WITHOUT_BODY) == 0,
+        "send_response: WITHOUT_BODY returns 0");
+
+    read_response(fds[1], response, sizeof(response));
+
+    // Content-Length MUST describe the body we deliberately did not send
+    const char *cl_prefix = "Content-Length: ";
+    char *len_line = strstr(response, cl_prefix);
+    int declared = len_line ? atoi(len_line + strlen(cl_prefix)) : -1;
+    check(declared == (int)strlen(body), "send_response: WITHOUT_BODY keeps real Content-Length");
+
+    // nothing at all after the header terminator
+    char *body_start = strstr(response, "\r\n\r\n");
+    check(body_start != NULL && strlen(body_start + 4) == 0,
+        "send_response: WITHOUT_BODY sends zero body bytes");
+
+    // and the body text is provably absent
+    check(strstr(response, "never be sent") == NULL,
+        "send_response: body text absent from response");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+static void test_head_response(void) {
+    int fds[2];
+    char get_resp[4096];
+    char head_resp[4096];
+
+    // GET /about
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    set_client_timeout(fds[0], 1);
+    const char *get_req = "GET /about HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], get_req, strlen(get_req), 0);
+    handle_client(fds[0]);
+    read_response(fds[1], get_resp, sizeof(get_resp));
+    close(fds[0]);
+    close(fds[1]);
+
+    // HEAD /about
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    set_client_timeout(fds[0], 1);
+    const char *head_req = "HEAD /about HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], head_req, strlen(head_req), 0);
+    handle_client(fds[0]);
+    read_response(fds[1], head_resp, sizeof(head_resp));
+    close(fds[0]);
+    close(fds[1]);
+
+    check(strstr(head_resp, "HTTP/1.1 200 OK") != NULL, "head: 200 OK");
+
+    // Content-Length MUST be identical to GET
+    const char *cl_prefix = "Content-Length: ";
+    char *get_len = strstr(get_resp, cl_prefix);
+    char *head_len = strstr(head_resp, cl_prefix);
+    check(get_len != NULL && head_len != NULL, "head: both have Content-Length");
+    check(get_len != NULL && head_len != NULL &&
+          atoi(get_len + strlen(cl_prefix)) == atoi(head_len + strlen(cl_prefix)),
+        "head: Content-Length identical to GET");
+
+    // but ZERO bytes of body
+    char *body_start = strstr(head_resp, "\r\n\r\n");
+    check(body_start != NULL && strlen(body_start + 4) == 0, "head: zero bytes of body");
+}
+
+static void test_rejects_other_methods(void) {
+    int fds[2];
+    char response[4096];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+
+    set_client_timeout(fds[0], 1);
+    const char *req = "DELETE / HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], req, strlen(req), 0);
+    handle_client(fds[0]);
+
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "405 Method Not Allowed") != NULL, "validate: DELETE still 405");
+    check(strstr(response, "Allow: GET, HEAD") != NULL, "validate: Allow lists HEAD");
+    close(fds[0]);
+    close(fds[1]);
+}
+
+static void test_head_error_path_has_no_body(void) {
+    int fds[2];
+    char response[4096];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+
+    set_client_timeout(fds[0], 1);
+    const char *req = "HEAD / HTTP/1.1\r\n\r\n";
+    send(fds[1], req, strlen(req), 0);
+    handle_client(fds[0]);
+
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "400 Bad Request") != NULL, "head: missing Host -> 400");
+    char *body_start = strstr(response, "\r\n\r\n");
+    check(body_start != NULL && strlen(body_start + 4) == 0,
+        "head: error response has no body");
+    close(fds[0]);
+    close(fds[1]);
+}
+
 int main(void) {
     test_parse_headers();
     test_parse_request_line();
@@ -285,8 +393,12 @@ int main(void) {
     test_url_decode();
     test_get_query_param();
     test_send_response();
+    test_send_response_without_body();
     test_get_header();
     test_handle_client_requires_host();
+    test_head_response();
+    test_head_error_path_has_no_body();
+    test_rejects_other_methods();
 
     printf("\n%d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;
