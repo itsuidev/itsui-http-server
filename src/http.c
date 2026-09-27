@@ -75,7 +75,7 @@ int parse_headers(char * buffer, HttpRequest * request) {
     return 0;
 }
 
-void send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers) {
+int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers) {
     char response[1024];
 
     int response_length = snprintf(
@@ -95,13 +95,8 @@ void send_response(int client_fd, int status_code, const char *status_text, cons
         body
     );
 
-    check_error(
-        response_length >= 0 && (size_t)response_length < sizeof(response),
-        "Error while creating HTTP response"
-    );
-
-    int send_status = send_all(client_fd, response, response_length);
-    check_error(send_status == 0, "Error while writing HTTP response");
+    if (response_length < 0 || (size_t)response_length >= (int)sizeof(response)) return -1;
+    return send_all(client_fd, response, response_length);
 }
 
 static int hex_to_value(char c) {
@@ -211,4 +206,53 @@ void handle_request(int client_fd, const HttpRequest *request) {
     }
 
     send_response(client_fd, HTTP_NOT_FOUND, "Not Found", "Not Found\n", "");
+}
+
+void handle_client(int client_fd) {
+    char buffer[BUFFER_SIZE] = {0};
+
+    int read_status = read_request(client_fd, buffer, sizeof(buffer));
+    if (read_status == -2) {
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Request too large\n", "");
+        return;
+    }
+
+    if (read_status < 0) {
+        return;
+    }
+
+    HttpRequest request;
+
+    int parse_status = parse_request_line(buffer, &request);
+    if (parse_status < 0) {
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+        return;
+    }
+
+    int validation_status = validate_request(&request);
+    if (validation_status == -1) {
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+        return;
+    }
+    if (validation_status == 1) {
+        send_response(client_fd, HTTP_METHOD_NOT_ALLOWED, "Method Not Allowed", "Method Not Allowed\n", "Allow: GET\r\n");
+        return;
+    }
+
+    printf("Method: %s\n", request.method);
+    printf("Path: %s\n", request.path);
+    printf("Version: %s\n", request.version);
+
+    int headers_status = parse_headers(buffer, &request);
+    if (headers_status < 0) {
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "");
+        return;
+    }
+    
+    for (int i = 0; i < request.header_count; i++) {
+        printf("Header name: %s\n", request.headers[i].name);
+        printf("Header value: %s\n", request.headers[i].value);
+    }
+
+    handle_request(client_fd, &request);
 }

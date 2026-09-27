@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 
 #include "server.h"
@@ -47,6 +48,20 @@ int accept_client(int server_fd) {
     check_error(client_fd >= 0, "Error while accepting client");
 
     return client_fd;
+}
+
+int set_client_timeout(int client_fd, int seconds) {
+    struct timeval tv;
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+
+    int rcv_status = setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (rcv_status == -1) return -1;
+
+    int snd_status = setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (snd_status == -1) return -1;
+
+    return 0;
 }
 
 int send_all(int client_fd, const char *buffer, size_t length) {
