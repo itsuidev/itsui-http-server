@@ -42,26 +42,74 @@ static int read_response(int fd, char *buf, size_t buf_size) {
     return (int)total;
 }
 
-static void test_url_decode(void) {
+static void test_decode_component(void) {
     char s[64];
 
     strcpy(s, "Igor");
-    check(url_decode(s) == 0 && str_eq(s, "Igor"), "url_decode: no changes");
+    check(decode_component(s, DECODE_QUERY) == 0 && str_eq(s, "Igor"),
+          "decode_component: no changes");
 
     strcpy(s, "Igor%20Suvic");
-    check(url_decode(s) == 0 && str_eq(s, "Igor Suvic"), "url_decode: %20 -> whitespace");
+    check(decode_component(s, DECODE_QUERY) == 0 && str_eq(s, "Igor Suvic"),
+          "decode_component: %20 -> whitespace");
 
     strcpy(s, "a+b");
-    check(url_decode(s) == 0 && str_eq(s, "a b"), "url_decode: + -> whitespace");
+    check(decode_component(s, DECODE_QUERY) == 0 && str_eq(s, "a b"),
+          "decode_component: + -> whitespace");
 
     strcpy(s, "%41%42");
-    check(url_decode(s) == 0 && str_eq(s, "AB"), "url_decode: %41%42 -> AB");
+    check(decode_component(s, DECODE_QUERY) == 0 && str_eq(s, "AB"),
+          "decode_component: %41%42 -> AB");
 
     strcpy(s, "100%");
-    check(url_decode(s) == 0 && str_eq(s, "100%"), "url_decode: unfinished % is copied");
+    check(decode_component(s, DECODE_QUERY) == 0 && str_eq(s, "100%"),
+          "decode_component: unfinished % is copied");
 
     strcpy(s, "%ZZ");
-    check(url_decode(s) == -1, "url_decode: bad hex -> -1");
+    check(decode_component(s, DECODE_QUERY) == -1,
+          "decode_component: bad hex -> -1");
+
+    strcpy(s, "a%00b");
+    check(decode_component(s, DECODE_QUERY) == -1,
+          "decode_component: NUL rejected");
+}
+
+static void test_decode_path(void) {
+    char s[64];
+
+    // the whole point of 6.5: a percent-encoded path reaches its route
+    strcpy(s, "/hel%6co");
+    check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "/hello"),
+          "path: %6c -> l");
+
+    strcpy(s, "/%68ello");
+    check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "/hello"),
+          "path: %68 -> h");
+
+    strcpy(s, "/%41%42");
+    check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "/AB"),
+          "path: hex decode");
+
+    strcpy(s, "/a%2Fb");
+    check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "/a/b"),
+          "path: %2F -> /");
+
+    // same input, different mode, different result. These two checks are the
+    // only ones that prove DecodeMode is doing anything at all.
+    strcpy(s, "a+b");
+    check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "a+b"),
+          "path: '+' stays '+'");
+    strcpy(s, "a+b");
+    check(decode_component(s, DECODE_QUERY) == 0 && str_eq(s, "a b"),
+          "query: '+' -> whitespace");
+
+    strcpy(s, "a%ZZb");
+    check(decode_component(s, DECODE_PATH) == -1,
+          "path: bad hex -> -1");
+
+    strcpy(s, "a%00b");
+    check(decode_component(s, DECODE_PATH) == -1,
+          "path: NUL rejected");
 }
 
 static void test_get_query_param(void) {
@@ -386,11 +434,69 @@ static void test_head_error_path_has_no_body(void) {
     close(fds[1]);
 }
 
+static void test_decoded_path_routes(void) {
+    int fds[2];
+    char response[4096];
+
+    // Every other test in this file covers one function. This one covers the
+    // pipeline parse -> validate -> decode -> route, which is where the
+    // percent-decoding bug lived: each stage was individually correct.
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    set_client_timeout(fds[0], 1);
+    const char *encoded = "GET /hel%6co HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], encoded, strlen(encoded), 0);
+    handle_client(fds[0]);
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "HTTP/1.1 200 OK") != NULL,
+          "pipeline: percent-encoded path reaches its route");
+    check(strstr(response, "Hello!") != NULL,
+          "pipeline: percent-encoded path returns the route body");
+    close(fds[0]);
+    close(fds[1]);
+
+    // a malformed path is a bad request, not a missing resource
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    set_client_timeout(fds[0], 1);
+    const char *bad = "GET /hello%ZZ HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], bad, strlen(bad), 0);
+    handle_client(fds[0]);
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "400 Bad Request") != NULL,
+          "pipeline: bad percent-encoding in path -> 400");
+    close(fds[0]);
+    close(fds[1]);
+
+    // decoding must happen exactly once: %2520 is a literal %20, not a space
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    set_client_timeout(fds[0], 1);
+    const char *once = "GET /hello%2520 HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], once, strlen(once), 0);
+    handle_client(fds[0]);
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "HTTP/1.1 404 Not Found") != NULL,
+          "pipeline: decoded once, not twice");
+    close(fds[0]);
+    close(fds[1]);
+
+    // %00 must not truncate "/hello%00" into a different, matching route
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    set_client_timeout(fds[0], 1);
+    const char *nul = "GET /hello%00 HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], nul, strlen(nul), 0);
+    handle_client(fds[0]);
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "400 Bad Request") != NULL,
+          "pipeline: NUL in path -> 400, not a truncated route");
+    close(fds[0]);
+    close(fds[1]);
+}
+
 int main(void) {
     test_parse_headers();
     test_parse_request_line();
     test_validate_request();
-    test_url_decode();
+    test_decode_component();
+    test_decode_path();
     test_get_query_param();
     test_send_response();
     test_send_response_without_body();
@@ -399,6 +505,7 @@ int main(void) {
     test_head_response();
     test_head_error_path_has_no_body();
     test_rejects_other_methods();
+    test_decoded_path_routes();
 
     printf("\n%d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

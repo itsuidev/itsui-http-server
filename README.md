@@ -12,14 +12,47 @@ level: request parsing, connection lifecycle, concurrency, and failure handling.
 - Parses the request line, headers and query string
 - Validates method, version, path and the mandatory `Host` header
 - Looks up headers case-insensitively (`host`, `HOST`, `HoSt` all match)
-- Decodes percent-encoding in query values
+- Decodes percent-encoding in both the path and query values, exactly once
 - Answers `GET` and `HEAD`; `HEAD` returns identical headers with no body
 - Sends a `Date` header in every response, in UTC
 - Handles one connection per forked child process
 - Enforces read/write timeouts so slow clients cannot block the server
 - Ignores `SIGPIPE` and `SIGCHLD` so client disconnects and finished children
   cannot take the process down
-- 64 unit tests, verified by mutation testing
+- 78 unit tests, verified by mutation testing
+
+### Percent-decoding
+
+The path and the query string are both percent-decoded, but `+` means different
+things in each, so one decoder takes an explicit `DecodeMode`:
+
+| | `+` | `%2F` | `%00` |
+|---|---|---|---|
+| Path (`DECODE_PATH`) | literal `+`, RFC 3986 §3.3 | `/` | `400` |
+| Query value (`DECODE_QUERY`) | a space, `x-www-form-urlencoded` | `/` | `400` |
+
+A query string is `application/x-www-form-urlencoded`, where `+` really does mean
+a space. A path is not: `+` is a valid path character, so a file named `a+b.html`
+has to stay reachable at `/a+b.html`. One `int` flag would have hidden that
+difference at the call site, which is the same reason `ResponseBody` is an enum
+rather than an `int`.
+
+`%00` is rejected rather than decoded. Decoded it is a NUL, which terminates the
+string, so `/hello%00` would be seen by the router as `/hello` and match a route
+the client never asked for. Harmless while every route is a hard-coded string;
+the moment a path reaches the filesystem it is a NUL-byte injection.
+
+Decoding happens once, in `handle_client`, after `validate_request` and before
+routing. Once, because a second pass would turn `/%2520` into a space. In that
+position because the pipeline it belongs to is
+
+```
+raw bytes -> syntax check -> decode -> path traversal check -> filesystem
+```
+
+and the traversal check has to see decoded bytes: `..%2f` and `%2e%2e%2f` are the
+same path once decoded.
+
 
 ## Requirements
 
@@ -93,7 +126,12 @@ below is the exact byte at which the behaviour flips.
 | More than 32 headers | `400 Bad Request` | 32 accepted, 33 rejected |
 | Header name of 64 bytes or more | `400 Bad Request` | 63 B accepted, 64 B rejected |
 | Header value of 256 bytes or more | `400 Bad Request` | 255 B accepted, 256 B rejected |
-| Query value with invalid percent-encoding | `400 Bad Request` | `%ZZ` rejected, `%20` accepted |
+| Invalid percent-encoding in path or query value | `400 Bad Request` | `%ZZ` rejected, `%20` accepted |
+| `%00` anywhere in path or query value | `400 Bad Request` | see *Percent-decoding* above |
+
+An unfinished `%` is deliberately *not* an error: `%ZZ` is a bad hex pair and is
+rejected, while a trailing `100%` is copied through unchanged. That asymmetry is
+covered by a test.
 
 The head boundary is not exactly 1 KB because `read_request` stops at
 `BUFFER_SIZE - 1` = 1023 bytes, and a request that overshoots is cut off at a
@@ -215,7 +253,7 @@ immune to `SIGKILL`.
 
 ```bash
 make test
-# 64 passed, 0 failed
+# 78 passed, 0 failed
 ```
 
 | Test function | Checks |
@@ -223,7 +261,8 @@ make test
 | `test_parse_request_line` | 9 |
 | `test_parse_headers` | 6 |
 | `test_validate_request` | 5 |
-| `test_url_decode` | 6 |
+| `test_decode_component` | 7 |
+| `test_decode_path` | 8 |
 | `test_get_query_param` | 6 |
 | `test_send_response` | 13 |
 | `test_send_response_without_body` | 4 |
@@ -232,12 +271,13 @@ make test
 | `test_head_response` | 4 |
 | `test_head_error_path_has_no_body` | 2 |
 | `test_rejects_other_methods` | 2 |
+| `test_decoded_path_routes` | 5 |
 
 The pure-logic functions are tested directly. The functions that touch a socket
 are tested through `socketpair(AF_UNIX, SOCK_STREAM)`: one end plays the client,
 `handle_client` treats the other as a real connection, so the full parse →
-validate → route → respond path runs without a network or a port. Every such
-test sets a socket timeout *before* calling the code under test, so a wiring
+validate → decode → route → respond path runs without a network or a port. Every
+such test sets a socket timeout *before* calling the code under test, so a wiring
 mistake fails in one second with a readable message instead of hanging forever.
 
 `make test` exits non-zero on failure, so it can gate CI directly. No CI is
@@ -246,9 +286,10 @@ configured yet.
 ### Test strength
 
 A passing suite only proves the code matches the tests. Mutation testing checks
-the other direction: inject a deliberate fault, confirm a test notices. Ten
-faults were injected into the code and every one produced a failing test; one
-further attempt was rejected by the compiler before it could run.
+the other direction: inject a deliberate fault, confirm a test notices. Fourteen
+faults were injected into the code; thirteen produced a failing test, one further
+attempt was rejected by the compiler before it could run, and **one is still not
+covered** (below).
 
 | Injected fault | Caught by |
 |---|---|
@@ -263,14 +304,43 @@ further attempt was rejected by the compiler before it could run.
 | `Allow` header reverted to `GET` only | `validate: Allow lists HEAD` |
 | `Content-Length` computed from the sent body | 2 tests, incl. `head: Content-Length identical to GET` |
 | `body_mode` forced to `WITH_BODY` in `handle_client` | `head: error response has no body` |
+| `mode` check removed from the `+` branch | `path: '+' stays '+'` |
+| `%00` check removed from `decode_component` | 3 tests, incl. `path: NUL rejected` |
+| path decoding removed from `handle_client` | 4 tests, all in `pipeline: *` |
+| `DECODE_PATH` swapped for `DECODE_QUERY` at the call site | **nothing — see below** |
 
-The last row is the interesting one. It initially **passed all 64 tests**. The
-code was correct at the time, but nothing protected it: forcing `body_mode` to
-`WITH_BODY` only affects the error paths in `handle_client`, and no test sent a
-`HEAD` request down one of them. `test_head_error_path_has_no_body` was added to
-close that gap, after which the fault is caught. A correct function and a
-protected function are different things, and only mutation testing tells them
-apart.
+Two rows are worth reading twice.
+
+The `body_mode` fault initially **passed all 64 tests**. The code was correct at
+the time, but nothing protected it: forcing `body_mode` to `WITH_BODY` only
+affects the error paths in `handle_client`, and no test sent a `HEAD` request down
+one of them. `test_head_error_path_has_no_body` was added to close that gap, after
+which the fault is caught. A correct function and a protected function are
+different things, and only mutation testing tells them apart.
+
+The `DECODE_PATH` → `DECODE_QUERY` fault **still passes all 78 tests**, and that
+is a real gap rather than a weak test. The two modes differ only in how they treat
+`+`, and the difference is invisible unless a request's path contains a `+` that
+changes whether it matches a route. No route contains one. `test_decode_path`
+proves the modes behave differently, but it calls `decode_component` directly, so
+it never sees which mode `handle_client` passes. Nothing currently pins that
+call site. The mitigation is readability — `DECODE_PATH` in the source says "this
+is a path" — but readability is not a test. Static file serving will close this
+for free, since a file named `a+b` requested at `/a+b` and at `/a%2Bb` produces
+different files and different responses.
+
+### Tests cover functions, not pipelines
+
+The percent-decoding bug is the clearest argument for this section. `url_decode`
+and `handle_request` were each individually correct, and so were the tests around
+them. The bug lived in the seam: nothing decoded the path between parsing and
+routing, so no test that exercised one function at a time could ever have found
+it. It took a hand-written request against a running server.
+
+`test_decoded_path_routes` exists for that reason. It is the only test that sends
+a request through `parse → validate → decode → route`, and removing the decoding
+step fails four of its checks — more than any other mutation in the table.
+
 
 ## Performance
 
@@ -298,9 +368,9 @@ benchmark. A single `fork()` per request is the obvious bottleneck by design.
 
 Known gaps, all verified by hand against the running server:
 
-- **The path is not percent-decoded before routing.** `/hel%6co` returns `404`
-  even though it decodes to `/hello`. Query values *are* decoded, so the two
-  halves of the request line behave differently. RFC 9110 §4.2.3.
+- **The path is decoded, but the query string is scanned before it is decoded.**
+  `/hel%6co` routes correctly; so does `?name=Igor%20Srce`. There is no static
+  file serving yet, so there is nothing to traverse to.
 - **Multiple `Host` headers are accepted.** `get_header` returns the first match.
   RFC 9112 §3.2 requires rejecting the request with `400`.
 - **An unrecognised method returns `405`, not `501`.** `405` means "known method,
@@ -319,6 +389,12 @@ Known gaps, all verified by hand against the running server:
   SYN retransmission rather than being accepted promptly.
 - **Status codes are bare `#define`s.** Each one is spelled out as a string at
   every call site, with nothing keeping the two in sync.
+- **Nothing pins which `DecodeMode` `handle_client` passes.** Swapping it for
+  `DECODE_QUERY` passes all 78 tests, because the modes differ only in `+` and no
+  route contains one. Recorded here rather than papered over with a contrived
+  route; static file serving closes it.
+- **An unfinished `%` is copied instead of rejected.** `100%` survives, while
+  `%ZZ` is a `400`. Both are malformed in the same way and get different answers.
 - **The request line is parsed with `sscanf`, which truncates instead of
   reporting.** `sscanf("%15s %255s %15s")` cannot fail on an over-long field — it
   returns 3 conversions and hands back a truncated value. Two consequences: a

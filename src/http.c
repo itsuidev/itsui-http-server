@@ -130,7 +130,7 @@ static int hex_to_value(char c) {
     return -1;
 }
 
-int url_decode(char *str) {
+int decode_component(char *str, DecodeMode mode) {
     char *read = str;
     char *write = str;
 
@@ -141,10 +141,13 @@ int url_decode(char *str) {
 
             if (high < 0 || low < 0) return -1;
 
-            *write = (char)(high * 16 + low);
+            int decoded = high * 16 + low;
+            if (decoded == 0) return -1;
+
+            *write = (char)decoded;
             read += 3;
             write++;
-        } else if (*read == '+') {
+        } else if (*read == '+' && mode == DECODE_QUERY) {
             *write = ' ';
             read++;
             write++; 
@@ -176,7 +179,7 @@ int get_query_param(const HttpRequest *request, const char *name, char *value, s
                 strncpy(value, equals + 1, value_size - 1);
                 value[value_size - 1] = '\0';
 
-                if (url_decode(value) < 0) return -1;
+                if (decode_component(value, DECODE_QUERY) < 0) return -1;
 
                 return 0;
             }
@@ -264,6 +267,11 @@ void handle_client(int client_fd) {
     }
     if (validation_status == 1) {
         send_response(client_fd, HTTP_METHOD_NOT_ALLOWED, "Method Not Allowed", "Method Not Allowed\n", "Allow: GET, HEAD\r\n", body_mode);
+        return;
+    }
+
+    if (decode_component(request.path, DECODE_PATH) < 0) {
+        send_response(client_fd, HTTP_BAD_REQUEST, "Bad Request", "Bad Request\n", "", body_mode);
         return;
     }
 

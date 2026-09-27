@@ -9,6 +9,11 @@ typedef enum {
     WITHOUT_BODY
 } ResponseBody;
 
+typedef enum {
+    DECODE_QUERY,
+    DECODE_PATH
+} DecodeMode;
+
 typedef struct {
     char name[64];
     char value[256];
@@ -30,7 +35,7 @@ int get_header(const HttpRequest *request, const char *name, char *value, size_t
 int parse_headers(char *buffer, HttpRequest *request);
 int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers, ResponseBody body_mode);
 int get_query_param(const HttpRequest *request, const char *name, char *value, size_t value_size);
-int url_decode(char *str);
+int decode_component(char *str, DecodeMode mode);
 void handle_request(int client_fd, const HttpRequest *request);
 void handle_client(int client_fd);
 
