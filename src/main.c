@@ -20,7 +20,7 @@ int main(void) {
         pid_t pid = fork();
 
         if (pid == -1) {
-            send_response(client_fd, HTTP_INTERNAL_SERVER_ERROR, "Internal Server Error", "Server error\n", "", WITH_BODY);
+            send_response(client_fd, HTTP_INTERNAL_SERVER_ERROR, "Server error\n", "", WITH_BODY);
             close(client_fd);
             continue;
         }

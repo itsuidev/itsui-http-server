@@ -19,7 +19,7 @@ level: request parsing, connection lifecycle, concurrency, and failure handling.
 - Enforces read/write timeouts so slow clients cannot block the server
 - Ignores `SIGPIPE` and `SIGCHLD` so client disconnects and finished children
   cannot take the process down
-- 78 unit tests, verified by mutation testing
+- 91 unit tests, verified by mutation testing
 
 ### Percent-decoding
 
@@ -103,6 +103,39 @@ curl -I http://localhost:8000/about                   # -> headers only, same Co
 | `Connection` | `close` | `send_response` |
 | `Allow` | `GET, HEAD` | only on `405` |
 
+### `405` versus `501`
+
+These two answers look similar and mean opposite things, so the distinction is
+made deliberately rather than by accident:
+
+- `405 Method Not Allowed` — the method is a real HTTP method, and this resource
+  does not accept it. `Allow` is **required** (RFC 9110 §15.5.6).
+- `501 Not Implemented` — the token is not a method at all. `Allow` is
+  **meaningless**, because listing methods would contradict the message: it would
+  read as "use one of these instead", which is exactly the `405` case.
+
+So `POST` is a `405` and `BREW` is a `501`:
+
+```
+$ printf 'POST / HTTP/1.1\r\nHost: x\r\n\r\n'      | nc 127.0.0.1 8000 | head -1
+HTTP/1.1 405 Method Not Allowed
+$ printf 'BREW / HTTP/1.1\r\nHost: x\r\n\r\n'      | nc 127.0.0.1 8000 | head -1
+HTTP/1.1 501 Not Implemented
+```
+
+The boundary is the `KNOWN_METHODS` table in `src/http.c`, and it answers a
+narrower question than "what do we support":
+
+> Is this token a method name defined by the HTTP specifications?
+
+Support is already communicated through `Allow`, so it is not the table's job.
+The eight core methods are RFC 9110; `PATCH` is RFC 5789 rather than RFC 9110,
+but it is deployed by essentially every REST API, so calling it undefined would
+be wrong. Adding a method is one line in the array and nothing else.
+
+Method names are **case-sensitive** (RFC 9110 §9.1), which falls out of using
+`strcmp`: `get` is a `501`, not a misspelled `GET`.
+
 `Date` and `Content-Length` are built inside `send_response` rather than at the
 call sites, so a response cannot go out without them. `Content-Length` is
 computed before the body is optionally skipped, which is what makes a `HEAD`
@@ -115,7 +148,8 @@ below is the exact byte at which the behaviour flips.
 
 | Condition | Status | Boundary |
 |---|---|---|
-| Method other than `GET` or `HEAD` | `405 Method Not Allowed` + `Allow: GET, HEAD` | — |
+| Known method other than `GET` or `HEAD` | `405 Method Not Allowed` + `Allow: GET, HEAD` | — |
+| Unrecognised method token | `501 Not Implemented`, no `Allow` | — |
 | Version other than `HTTP/1.1` | `400 Bad Request` | — |
 | Path not starting with `/` | `400 Bad Request` | — |
 | Missing `Host` header | `400 Bad Request` | — |
@@ -194,7 +228,7 @@ start_server()                 socket -> SO_REUSEADDR -> bind -> listen
 handle_client()
   read_request()      accumulate until "\r\n\r\n" or buffer full
   parse_request_line()  method, path, version -> split path from query
-  validate_request()   method/version/path rules
+  validate_request()   classify method (known? allowed?), then version/path rules
   parse_headers()      fill headers[] (destroys the raw buffer via strtok)
   get_header()         case-insensitive header lookup
   handle_request()     route by path, send response
@@ -253,14 +287,15 @@ immune to `SIGKILL`.
 
 ```bash
 make test
-# 78 passed, 0 failed
+# 91 passed, 0 failed
 ```
 
 | Test function | Checks |
 |---|---|
 | `test_parse_request_line` | 9 |
 | `test_parse_headers` | 6 |
-| `test_validate_request` | 5 |
+| `test_validate_request` | 9 |
+| `test_status_text` | 6 |
 | `test_decode_component` | 7 |
 | `test_decode_path` | 8 |
 | `test_get_query_param` | 6 |
@@ -271,6 +306,7 @@ make test
 | `test_head_response` | 4 |
 | `test_head_error_path_has_no_body` | 2 |
 | `test_rejects_other_methods` | 2 |
+| `test_unrecognised_method` | 3 |
 | `test_decoded_path_routes` | 5 |
 
 The pure-logic functions are tested directly. The functions that touch a socket
@@ -286,14 +322,14 @@ configured yet.
 ### Test strength
 
 A passing suite only proves the code matches the tests. Mutation testing checks
-the other direction: inject a deliberate fault, confirm a test notices. Fourteen
-faults were injected into the code; thirteen produced a failing test, one further
-attempt was rejected by the compiler before it could run, and **one is still not
-covered** (below).
+the other direction: inject a deliberate fault, confirm a test notices.
+Twenty-one faults were injected into the code; twenty produced a failing test, one
+further attempt was rejected by the compiler before it could run, and **one is
+still not covered** (below).
 
 | Injected fault | Caught by |
 |---|---|
-| `validate_request` always returns `0` | `validate_request: POST -> 1 (405)` |
+| `validate_request` always returns `REQUEST_VALID` | `validate_request: POST -> REQUEST_METHOD_NOT_ALLOWED (405)` |
 | `+` decoding disabled in `url_decode` | `url_decode: + -> whitespace` |
 | multi-param query scanning broken | `get_query_param: second param` |
 | percent-decode errors ignored | `get_query_param: bad percent encoding -> -1` |
@@ -308,6 +344,12 @@ covered** (below).
 | `%00` check removed from `decode_component` | 3 tests, incl. `path: NUL rejected` |
 | path decoding removed from `handle_client` | 4 tests, all in `pipeline: *` |
 | `DECODE_PATH` swapped for `DECODE_QUERY` at the call site | **nothing — see below** |
+| `is_known_method` check removed from `validate_request` | 5 tests, incl. `validate: FROBNICATE -> 501` |
+| `strcmp` swapped for `strcasecmp` in `is_known_method` | 2 tests, incl. `validate: lowercase get -> 501` |
+| `Allow` header added to the `501` response | `validate: 501 carries no Allow header` |
+| `PATCH` removed from `KNOWN_METHODS` | `validate_request: PATCH -> REQUEST_METHOD_NOT_ALLOWED (405)` |
+| `501` branch switched to answer `405` | 4 tests, incl. `validate: FROBNICATE -> 501` |
+| `case HTTP_NOT_IMPLEMENTED` dropped from `status_text` | `status_text: 501` *and* a `-Wswitch` warning |
 
 Two rows are worth reading twice.
 
@@ -318,7 +360,8 @@ one of them. `test_head_error_path_has_no_body` was added to close that gap, aft
 which the fault is caught. A correct function and a protected function are
 different things, and only mutation testing tells them apart.
 
-The `DECODE_PATH` → `DECODE_QUERY` fault **still passes all 78 tests**, and that
+The `DECODE_PATH` → `DECODE_QUERY` fault **still passes all 91 tests**, re-verified
+after this change, and that
 is a real gap rather than a weak test. The two modes differ only in how they treat
 `+`, and the difference is invisible unless a request's path contains a `+` that
 changes whether it matches a route. No route contains one. `test_decode_path`
@@ -364,6 +407,46 @@ different program. The per-run spread (one burst measured 154–474 req/s) is
 WSL2 scheduler noise; treat the table as "it holds up under load", not as a
 benchmark. A single `fork()` per request is the obvious bottleneck by design.
 
+### Status codes
+
+`HttpStatus` is an enum, and `status_text()` maps it to a reason phrase. The
+reason phrase is not a parameter, so a call site has nowhere to put a typo:
+
+```c
+send_response(client_fd, HTTP_NOT_FOUND, "Not Found\n", "", body_mode);
+```
+
+The phrase lives in exactly one place:
+
+```c
+const char *status_text(HttpStatus status) {
+    switch (status) {
+        case HTTP_OK:                   return "OK";
+        case HTTP_BAD_REQUEST:          return "Bad Request";
+        /* ... */
+    }
+    return "";   // unreachable; see below
+}
+```
+
+The `switch` has no `default` case, and that is the point. Adding an enumerator
+without a `case` is a `-Wswitch` warning, verified:
+
+```
+src/http.c:81:5: warning: enumeration value 'HTTP_NOT_IMPLEMENTED' not handled in switch [-Wswitch]
+```
+
+The trailing `return "";` is needed because GCC does not treat an exhaustive
+switch as proof of a return — it emits `-Wreturn-type` without one. The two
+warnings are complementary and both are wanted: `default: return "";` would
+silence `-Wreturn-type` *and* kill the `-Wswitch` check, so the unreachable
+return is the correct way to keep the enforcement.
+
+This was not theoretical. Before the change, 13 of 14 call sites had a typo in
+the reason phrase caught by a test; the 14th, `500` on the `fork()` failure path,
+passed the whole suite at the time (78 tests) with the phrase misspelled as
+`Internal Server Err`. There is no way to express that mistake now.
+
 ## Limitations
 
 Known gaps, all verified by hand against the running server:
@@ -373,9 +456,6 @@ Known gaps, all verified by hand against the running server:
   file serving yet, so there is nothing to traverse to.
 - **Multiple `Host` headers are accepted.** `get_header` returns the first match.
   RFC 9112 §3.2 requires rejecting the request with `400`.
-- **An unrecognised method returns `405`, not `501`.** `405` means "known method,
-  not allowed here"; `501` means "this server does not implement the
-  functionality". RFC 9110 §15.5.6.
 - **An over-long request target returns `400`, not `414`.** RFC 9110 §15.5.15.
 - **The absolute-form request target is rejected.** `GET http://host/path
   HTTP/1.1` must be accepted by an HTTP/1.1 server. RFC 9112 §3.2.2.
@@ -387,10 +467,8 @@ Known gaps, all verified by hand against the running server:
 - **No `Server` header.** Optional under RFC 9110 §10.2.3.
 - **`BACKLOG` is 5.** A burst larger than the pending queue relies on kernel
   SYN retransmission rather than being accepted promptly.
-- **Status codes are bare `#define`s.** Each one is spelled out as a string at
-  every call site, with nothing keeping the two in sync.
 - **Nothing pins which `DecodeMode` `handle_client` passes.** Swapping it for
-  `DECODE_QUERY` passes all 78 tests, because the modes differ only in `+` and no
+  `DECODE_QUERY` passes all 91 tests, because the modes differ only in `+` and no
   route contains one. Recorded here rather than papered over with a contrived
   route; static file serving closes it.
 - **An unfinished `%` is copied instead of rejected.** `100%` survives, while
@@ -398,9 +476,9 @@ Known gaps, all verified by hand against the running server:
 - **The request line is parsed with `sscanf`, which truncates instead of
   reporting.** `sscanf("%15s %255s %15s")` cannot fail on an over-long field — it
   returns 3 conversions and hands back a truncated value. Two consequences: a
-  16-byte method is silently cut to 15 bytes and then rejected as `405` instead
-  of being reported as a malformed request, and a 256-byte target leaves its last
-  character to be read as the version. Both end in a `400`/`405`, so nothing is
+  16-byte method is silently cut to 15 bytes and then reported as `501` (verified)
+  instead of as a malformed request, and a 256-byte target leaves its last
+  character to be read as the version. Both end in a `400`/`501`, so nothing is
   accepted that should not be, but the request is refused for the wrong reason
   and the diagnostic is misleading. `strtok` or an explicit length check per
   field would fail loudly instead.

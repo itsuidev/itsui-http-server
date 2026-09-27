@@ -77,7 +77,6 @@ static void test_decode_component(void) {
 static void test_decode_path(void) {
     char s[64];
 
-    // the whole point of 6.5: a percent-encoded path reaches its route
     strcpy(s, "/hel%6co");
     check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "/hello"),
           "path: %6c -> l");
@@ -94,8 +93,6 @@ static void test_decode_path(void) {
     check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "/a/b"),
           "path: %2F -> /");
 
-    // same input, different mode, different result. These two checks are the
-    // only ones that prove DecodeMode is doing anything at all.
     strcpy(s, "a+b");
     check(decode_component(s, DECODE_PATH) == 0 && str_eq(s, "a+b"),
           "path: '+' stays '+'");
@@ -144,6 +141,8 @@ static void test_get_query_param(void) {
 static void test_parse_headers(void) {
     HttpRequest req;
     memset(&req, 0, sizeof(req));
+
+    // 1. single header
     char buf[128];
     strcpy(buf, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
     parse_request_line(buf, &req);
@@ -152,7 +151,7 @@ static void test_parse_headers(void) {
     check(str_eq(req.headers[0].name, "Host"), "parse_headers: header name");
     check(str_eq(req.headers[0].value, "x"), "parse_headers: header value");
 
-    // multiple headers
+    // 2. multiple headers
     char buf2[128];
     strcpy(buf2, "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: curl\r\n\r\n");
     memset(&req, 0, sizeof(req));
@@ -160,14 +159,14 @@ static void test_parse_headers(void) {
     parse_headers(buf2, &req);
     check(req.header_count == 2, "parse_headers: 2 headers");
 
-    // no colon -> -1
+    // 3. no colon -> -1
     char buf3[128];
     strcpy(buf3, "GET / HTTP/1.1\r\nWeirdNoColon\r\n\r\n");
     memset(&req, 0, sizeof(req));
     parse_request_line(buf3, &req);
     check(parse_headers(buf3, &req) == -1, "parse_headers: no colon -> -1");
 
-    // 33 headers -> -1
+    // 4. 33 headers -> -1
     char buf4[2048];
     int n = snprintf(buf4, sizeof(buf4), "GET / HTTP/1.1\r\n");
     for (int i = 0; i < 33; i++) n += snprintf(buf4 + n, sizeof(buf4) - n, "X-H%d: v\r\n", i);
@@ -185,7 +184,7 @@ static void test_parse_request_line(void) {
     parse_request_line(buf, &req);
     check(memcmp(buf, backup, sizeof(buf)) == 0, "parse_request_line: buffer unchanged");
     
-    // path and query split apart
+    // 2. path and query split apart
     strcpy(buf, "GET /hello?name=Igor HTTP/1.1\r\n");
     memset(&req, 0, sizeof(req));
     check(parse_request_line(buf, &req) == 0, "parse_request_line: success");
@@ -194,19 +193,19 @@ static void test_parse_request_line(void) {
     check(str_eq(req.query, "name=Igor"), "parse_request_line: query");
     check(str_eq(req.version, "HTTP/1.1"), "parse_request_line: version");
 
-    // no query string
+    // 3. no query string
     strcpy(buf, "GET / HTTP/1.1\r\n");
     memset(&req, 0, sizeof(req));
     parse_request_line(buf, &req);
     check(str_eq(req.query, ""), "parse_request_line: empty query");
 
-    // multiple params
+    // 4. multiple params
     strcpy(buf, "GET /a?b=1&c=2 HTTP/1.1\r\n");
     memset(&req, 0, sizeof(req));
     parse_request_line(buf, &req);
     check(str_eq(req.query, "b=1&c=2"), "parse_request_line: multiple params");
 
-    // too few tokens -> -1
+    // 5. too few tokens -> -1
     strcpy(buf, "GET\r\n");
     memset(&req, 0, sizeof(req));
     check(parse_request_line(buf, &req) == -1, "parse_request_line: too few tokens -> -1");
@@ -219,21 +218,53 @@ static void test_validate_request(void) {
     strcpy(req.method, "GET");
     strcpy(req.version, "HTTP/1.1");
     strcpy(req.path, "/");
-    check(validate_request(&req) == 0, "validate_request: GET / -> 0");
+    check(validate_request(&req) == REQUEST_VALID, "validate_request: GET / -> REQUEST_VALID");
 
     strcpy(req.path, "/hello");
-    check(validate_request(&req) == 0, "validate_request: GET /hello -> 0");
+    check(validate_request(&req) == REQUEST_VALID, "validate_request: GET /hello -> REQUEST_VALID");
 
     strcpy(req.method, "POST");
-    check(validate_request(&req) == 1, "validate_request: POST -> 1 (405)");
+    check(validate_request(&req) == REQUEST_METHOD_NOT_ALLOWED,
+          "validate_request: POST -> REQUEST_METHOD_NOT_ALLOWED (405)");
 
     strcpy(req.method, "GET");
     strcpy(req.version, "HTTP/1.0");
-    check(validate_request(&req) == -1, "validate_request: HTTP/1.0 -> -1 (400)");
+    check(validate_request(&req) == REQUEST_MALFORMED,
+          "validate_request: HTTP/1.0 -> REQUEST_MALFORMED (400)");
 
     strcpy(req.version, "HTTP/1.1");
     strcpy(req.path, "hello");
-    check(validate_request(&req) == -1, "validate_request: path without / -> -1 (400)");
+    check(validate_request(&req) == REQUEST_MALFORMED,
+          "validate_request: path without / -> REQUEST_MALFORMED (400)");
+
+    // A token that is not a method at all is 501, not 405.
+    strcpy(req.path, "/");
+    strcpy(req.method, "FROBNICATE");
+    check(validate_request(&req) == REQUEST_METHOD_UNRECOGNISED,
+          "validate_request: FROBNICATE -> REQUEST_METHOD_UNRECOGNISED (501)");
+
+    // Methods are case-sensitive (RFC 9110 9.1), so lowercase get is not GET.
+    strcpy(req.method, "get");
+    check(validate_request(&req) == REQUEST_METHOD_UNRECOGNISED,
+          "validate_request: lowercase get -> REQUEST_METHOD_UNRECOGNISED (501)");
+
+    // Every real method we do not serve is 405, not 501.
+    strcpy(req.method, "PATCH");
+    check(validate_request(&req) == REQUEST_METHOD_NOT_ALLOWED,
+          "validate_request: PATCH -> REQUEST_METHOD_NOT_ALLOWED (405)");
+
+    strcpy(req.method, "OPTIONS");
+    check(validate_request(&req) == REQUEST_METHOD_NOT_ALLOWED,
+          "validate_request: OPTIONS -> REQUEST_METHOD_NOT_ALLOWED (405)");
+}
+
+static void test_status_text(void) {
+    check(str_eq(status_text(HTTP_OK), "OK"), "status_text: 200 -> OK");
+    check(str_eq(status_text(HTTP_BAD_REQUEST), "Bad Request"), "status_text: 400");
+    check(str_eq(status_text(HTTP_NOT_FOUND), "Not Found"), "status_text: 404");
+    check(str_eq(status_text(HTTP_METHOD_NOT_ALLOWED), "Method Not Allowed"), "status_text: 405");
+    check(str_eq(status_text(HTTP_INTERNAL_SERVER_ERROR), "Internal Server Error"), "status_text: 500");
+    check(str_eq(status_text(HTTP_NOT_IMPLEMENTED), "Not Implemented"), "status_text: 501");
 }
 
 static void test_send_response(void) {
@@ -243,7 +274,7 @@ static void test_send_response(void) {
     // 1. small body
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     char body[] = "Hello!";
-    check(send_response(fds[0], 200, "OK", body, "", WITH_BODY) == 0, "send_response: small body returns 0");
+    check(send_response(fds[0], HTTP_OK, body, "", WITH_BODY) == 0, "send_response: small body returns 0");
     read_response(fds[1], response, sizeof(response));
     check(strstr(response, "HTTP/1.1 200 OK") != NULL, "send_response: status line");
     check(strstr(response, "Content-Length: 6") != NULL, "send_response: Content-Length matches body");
@@ -259,28 +290,28 @@ static void test_send_response(void) {
     memset(big_body, 'x', 5000);
     big_body[5000] = '\0';
 
-    check(send_response(fds[0], 200, "OK", big_body, "", WITH_BODY) == 0, "send_response: 5000 byte body returns 0");
+    check(send_response(fds[0], HTTP_OK, big_body, "", WITH_BODY) == 0, "send_response: 5000 byte body returns 0");
     int total = read_response(fds[1], response, sizeof(response));
     check(strstr(response, "Content-Length: 5000") != NULL, "send_response: large Content-Length");
     check(total > 5000, "send_response: full large body received");
 
-    // verify the body is intact and not truncated
+    // 3. verify the body is intact and not truncated
     char *body_start = strstr(response, "\r\n\r\n");
     check(body_start != NULL && (int)strlen(body_start + 4) == 5000, "send_response: body not truncated");
     close(fds[0]);
     close(fds[1]);
 
-    // 3. error status
+    // 4. error status
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
-    send_response(fds[0], 404, "Not Found", "Not Found\n", "", WITH_BODY);
+    send_response(fds[0], HTTP_NOT_FOUND, "Not Found\n", "", WITH_BODY);
     read_response(fds[1], response, sizeof(response));
     check(strstr(response, "HTTP/1.1 404 Not Found") != NULL, "send_response: 404 status line");
     close(fds[0]);
     close(fds[1]);
 
-    // 4. empty body - covers the early return branch
+    // 5. empty body - covers the early return branch
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
-    check(send_response(fds[0], 200, "OK", "", "", WITH_BODY) == 0, "send_response: empty body returns 0");
+    check(send_response(fds[0], HTTP_OK, "", "", WITH_BODY) == 0, "send_response: empty body returns 0");
     read_response(fds[1], response, sizeof(response));
     check(strstr(response, "Content-Length: 0") != NULL, "send_response: empty Content-Length");
     close(fds[0]);
@@ -292,7 +323,7 @@ static void test_get_header(void) {
     char value[64];
     char buf[128];
 
-    // exact match
+    // 1. exact match
     strcpy(buf, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
     memset(&req, 0, sizeof(req));
     parse_request_line(buf, &req);
@@ -300,12 +331,12 @@ static void test_get_header(void) {
     check(get_header(&req, "Host", value, sizeof(value)) == 0, "get_header: found Host");
     check(str_eq(value, "example.com"), "get_header: Host value");
 
-    // case-insensitive: all variants find the same header
+    // 2. case-insensitive: all variants find the same header
     check(get_header(&req, "host", value, sizeof(value)) == 0, "get_header: lowercase query name");
     check(get_header(&req, "HOST", value, sizeof(value)) == 0, "get_header: uppercase query name");
     check(get_header(&req, "HoSt", value, sizeof(value)) == 0, "get_header: mixed case query name");
 
-    // non-existent -> 1
+    // 3. non-existent -> 1
     check(get_header(&req, "X-Nope", value, sizeof(value)) == 1, "get_header: missing -> 1");
 }
 
@@ -333,7 +364,7 @@ static void test_send_response_without_body(void) {
 
     const char *body = "This body must never be sent.\n";
 
-    check(send_response(fds[0], 200, "OK", body, "", WITHOUT_BODY) == 0,
+    check(send_response(fds[0], HTTP_OK, body, "", WITHOUT_BODY) == 0,
         "send_response: WITHOUT_BODY returns 0");
 
     read_response(fds[1], response, sizeof(response));
@@ -415,6 +446,37 @@ static void test_rejects_other_methods(void) {
     close(fds[1]);
 }
 
+static void test_unrecognised_method(void) {
+    int fds[2];
+    char response[4096];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+
+    set_client_timeout(fds[0], 1);
+    const char *req = "FROBNICATE / HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], req, strlen(req), 0);
+    handle_client(fds[0]);
+
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "501 Not Implemented") != NULL, "validate: FROBNICATE -> 501");
+    // Allow is required for 405 and meaningless for 501: 501 says the
+    // functionality is absent, not that another method would work here.
+    check(strstr(response, "Allow:") == NULL, "validate: 501 carries no Allow header");
+    close(fds[0]);
+    close(fds[1]);
+
+    // Case-sensitive per RFC 9110 9.1 - lowercase get is not GET.
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    set_client_timeout(fds[0], 1);
+    const char *lower = "get / HTTP/1.1\r\nHost: x\r\n\r\n";
+    send(fds[1], lower, strlen(lower), 0);
+    handle_client(fds[0]);
+
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "501 Not Implemented") != NULL, "validate: lowercase get -> 501");
+    close(fds[0]);
+    close(fds[1]);
+}
+
 static void test_head_error_path_has_no_body(void) {
     int fds[2];
     char response[4096];
@@ -438,9 +500,6 @@ static void test_decoded_path_routes(void) {
     int fds[2];
     char response[4096];
 
-    // Every other test in this file covers one function. This one covers the
-    // pipeline parse -> validate -> decode -> route, which is where the
-    // percent-decoding bug lived: each stage was individually correct.
     socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
     set_client_timeout(fds[0], 1);
     const char *encoded = "GET /hel%6co HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -505,7 +564,9 @@ int main(void) {
     test_head_response();
     test_head_error_path_has_no_body();
     test_rejects_other_methods();
+    test_unrecognised_method();
     test_decoded_path_routes();
+    test_status_text();
 
     printf("\n%d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;
