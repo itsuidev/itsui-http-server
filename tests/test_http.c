@@ -1,5 +1,8 @@
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include "http.h"
 
@@ -21,6 +24,20 @@ static int str_eq(const char *a, const char *b) {
 static void set_query(HttpRequest *req, const char *q) {
     memset(req, 0, sizeof(*req));
     strncpy(req->query, q, sizeof(req->query) - 1);
+}
+
+static int read_response(int fd, char *buf, size_t buf_size) {
+    struct timeval tv = {0, 50000};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    size_t total = 0;
+    while (total < buf_size - 1) {
+        ssize_t n = read(fd, buf + total, buf_size - 1 - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
+    buf[total] = '\0';
+    return (int)total;
 }
 
 static void test_url_decode(void) {
@@ -169,12 +186,62 @@ static void test_validate_request(void) {
     check(validate_request(&req) == -1, "validate_request: path without / -> -1 (400)");
 }
 
+static void test_send_response(void) {
+    int fds[2];
+    char response[8192];
+
+    // 1. small body
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    char body[] = "Hello!";
+    check(send_response(fds[0], 200, "OK", body, "") == 0, "send_response: small body returns 0");
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "HTTP/1.1 200 OK") != NULL, "send_response: status line");
+    check(strstr(response, "Content-Length: 6") != NULL, "send_response: Content-Length matches body");
+    check(strstr(response, "Hello!") != NULL, "send_response: body present");
+    close(fds[0]);
+    close(fds[1]);
+
+    // 2. large body - THIS ONE FAILS BEFORE THE FIX
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    char big_body[5001];
+    memset(big_body, 'x', 5000);
+    big_body[5000] = '\0';
+
+    check(send_response(fds[0], 200, "OK", big_body, "") == 0, "send_response: 5000 byte body returns 0");
+    int total = read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "Content-Length: 5000") != NULL, "send_response: large Content-Length");
+    check(total > 5000, "send_response: full large body received");
+
+    // verify the body is intact and not truncated
+    char *body_start = strstr(response, "\r\n\r\n");
+    check(body_start != NULL && (int)strlen(body_start + 4) == 5000, "send_response: body not truncated");
+    close(fds[0]);
+    close(fds[1]);
+
+    // 3. error status
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    send_response(fds[0], 404, "Not Found", "Not Found\n", "");
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "HTTP/1.1 404 Not Found") != NULL, "send_response: 404 status line");
+    close(fds[0]);
+    close(fds[1]);
+
+    // 4. empty body - covers the early return branch
+    socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+    check(send_response(fds[0], 200, "OK", "", "") == 0, "send_response: empty body returns 0");
+    read_response(fds[1], response, sizeof(response));
+    check(strstr(response, "Content-Length: 0") != NULL, "send_response: empty Content-Length");
+    close(fds[0]);
+    close(fds[1]);
+}
+
 int main(void) {
     test_parse_headers();
     test_parse_request_line();
     test_validate_request();
     test_url_decode();
     test_get_query_param();
+    test_send_response();
 
     printf("\n%d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

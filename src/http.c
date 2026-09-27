@@ -76,27 +76,31 @@ int parse_headers(char * buffer, HttpRequest * request) {
 }
 
 int send_response(int client_fd, int status_code, const char *status_text, const char *body, const char *extra_headers) {
-    char response[1024];
+    char header_buffer[BUFFER_SIZE];
 
-    int response_length = snprintf(
-        response,
-        sizeof(response),
+    int header_length = snprintf(
+        header_buffer,
+        sizeof(header_buffer),
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: text/plain; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "%s"
-        "\r\n"
-        "%s",
+        "\r\n",
         status_code,
         status_text,
         strlen(body),
-        extra_headers,
-        body
+        extra_headers
     );
+    if (header_length < 0 || (size_t)header_length >= (int)sizeof(header_buffer)) return -1;
 
-    if (response_length < 0 || (size_t)response_length >= (int)sizeof(response)) return -1;
-    return send_all(client_fd, response, response_length);
+    int header_status = send_all(client_fd, header_buffer, header_length);
+    if (header_status != 0) return -1;
+
+    size_t body_length = strlen(body);
+    if (body_length == 0) return 0;
+
+    return send_all(client_fd, body, body_length);
 }
 
 static int hex_to_value(char c) {
