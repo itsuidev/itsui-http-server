@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/types.h>
 
 #include "server.h"
 #include "http.h"
@@ -8,12 +9,28 @@
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
     int server_fd = start_server(PORT);
 
     while(1) {
         int client_fd = accept_client(server_fd);
         set_client_timeout(client_fd, CLIENT_TIMEOUT_SEC);
-        handle_client(client_fd);
+
+        pid_t pid = fork();
+
+        if (pid == -1) {
+            send_response(client_fd, HTTP_INTERNAL_SERVER_ERROR, "Internal Server Error", "Server error\n", "");
+            close(client_fd);
+            continue;
+        }
+
+        if (pid == 0) {
+            close(server_fd);
+            handle_client(client_fd);
+            close(client_fd);
+            _exit(0);
+        }
+
         close(client_fd);
     }
 
